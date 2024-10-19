@@ -1,0 +1,16 @@
+{
+    "recommendations": [
+        "biomejs.biome",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.poetry",
+        "ms-python.mypy-type-checker",
+        "zeshuaro.vscode-python-poetry",
+        "editorconfig.editorconfig",
+        "charliermarsh.ruff",
+        "redhat.vscode-yaml",
+        "foxundermoon.shell-format",
+        "statelyai.stately-vscode",
+        "ryanluker.vscode-coverage-gutters"
+    ]
+}
