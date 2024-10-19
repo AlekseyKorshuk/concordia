@@ -32,7 +32,6 @@ import numpy as np
 import together
 from typing_extensions import override
 
-
 _MAX_ATTEMPTS = 20
 _NUM_SILENT_ATTEMPTS = 3
 _SECONDS_TO_SLEEP_WHEN_RATE_LIMITED = 2
@@ -52,251 +51,312 @@ _NUM_INITIAL_TOKENS = 500
 def _ensure_prompt_not_too_long(
     prompt: str,
     num_response_tokens: int,
-    guess_chars_per_token: int = _GUESS_CHARS_PER_TOKEN) -> str:
-  r"""Ensures the prompt is not too long for Together AI\'s Gemma-2 models."""
-  num_initial_chars = _NUM_INITIAL_TOKENS * guess_chars_per_token
-  max_prompt_tokens = _MAX_ALLOWED_TOKENS - num_response_tokens
-  if max_prompt_tokens <= 0:
-    raise ValueError(
-        f'Cannot reserve {num_response_tokens} of {_MAX_ALLOWED_TOKENS} tokens.'
+    guess_chars_per_token: int = _GUESS_CHARS_PER_TOKEN,
+) -> str:
+    r"""Ensures the prompt is not too long for Together AI\'s Gemma-2 models."""
+    num_initial_chars = _NUM_INITIAL_TOKENS * guess_chars_per_token
+    max_prompt_tokens = _MAX_ALLOWED_TOKENS - num_response_tokens
+    if max_prompt_tokens <= 0:
+        raise ValueError(
+            f"Cannot reserve {num_response_tokens} of {_MAX_ALLOWED_TOKENS} tokens."
+        )
+    max_prompt_chars = max_prompt_tokens * guess_chars_per_token
+    if len(prompt) <= max_prompt_chars:
+        return prompt
+
+    # Keep the first _NUM_INITIAL_TOKENS tokens and then skip to the last tokens
+    # and take as many as we can from the end.
+    if max_prompt_chars > num_initial_chars:
+        num_final_chars = max_prompt_chars - num_initial_chars
+        new_prompt = prompt[:num_initial_chars] + prompt[-num_final_chars:]
+        logging.info(
+            "Prompt too long, trimmed it down, while keeping start and "
+            "end, resulting in %d characters",
+            len(new_prompt),
+        )
+        logging.debug("Trimmed prompt: %s", new_prompt)
+        return new_prompt
+
+    # This happens if len(prompt) > max_prompt_chars <= num_initial_chars.
+    new_prompt = prompt[-max_prompt_chars:]
+    logging.info(
+        "Prompt too long, truncated it to last %d characters.", max_prompt_chars
     )
-  max_prompt_chars = max_prompt_tokens * guess_chars_per_token
-  if len(prompt) <= max_prompt_chars:
-    return prompt
-
-  # Keep the first _NUM_INITIAL_TOKENS tokens and then skip to the last tokens
-  # and take as many as we can from the end.
-  if max_prompt_chars > num_initial_chars:
-    num_final_chars = max_prompt_chars - num_initial_chars
-    new_prompt = prompt[:num_initial_chars] + prompt[-num_final_chars:]
-    logging.info('Prompt too long, trimmed it down, while keeping start and '
-                 'end, resulting in %d characters', len(new_prompt))
-    logging.debug('Trimmed prompt: %s', new_prompt)
+    logging.debug("Truncated prompt: %s", new_prompt)
     return new_prompt
-
-  # This happens if len(prompt) > max_prompt_chars <= num_initial_chars.
-  new_prompt = prompt[-max_prompt_chars:]
-  logging.info(
-      'Prompt too long, truncated it to last %d characters.',
-      max_prompt_chars
-  )
-  logging.debug('Truncated prompt: %s', new_prompt)
-  return new_prompt
 
 
 class Gemma2(language_model.LanguageModel):
-  """Language Model that uses Together AI models."""
+    """Language Model that uses Together AI models."""
 
-  def __init__(
-      self,
-      model_name: str,
-      *,
-      api_key: str | None = None,
-      measurements: measurements_lib.Measurements | None = None,
-      channel: str = language_model.DEFAULT_STATS_CHANNEL,
-  ):
-    """Initializes the instance.
+    def __init__(
+        self,
+        model_name: str,
+        *,
+        api_key: str | None = None,
+        measurements: measurements_lib.Measurements | None = None,
+        channel: str = language_model.DEFAULT_STATS_CHANNEL,
+    ):
+        """Initializes the instance.
 
-    Args:
-      model_name: The language model to use. For more details, see
-        https://api.together.xyz/models.
-      api_key: The API key to use when accessing the Together AI API. If None,
-        will use the TOGETHER_AI_API_KEY environment variable.
-      measurements: The measurements object to log usage statistics to.
-      channel: The channel to write the statistics to.
-    """
-    if api_key is None:
-      api_key = os.environ['TOGETHER_AI_API_KEY']
-    self._api_key = api_key
-    self._model_name = model_name
-    self._measurements = measurements
-    self._channel = channel
-    self._client = together.Together(api_key=self._api_key)
-
-  @override
-  def sample_text(
-      self,
-      prompt: str,
-      *,
-      max_tokens: int = language_model.DEFAULT_MAX_TOKENS,
-      terminators: Collection[str] = language_model.DEFAULT_TERMINATORS,
-      temperature: float = language_model.DEFAULT_TEMPERATURE,
-      timeout: float = language_model.DEFAULT_TIMEOUT_SECONDS,
-      seed: int | None = None,
-  ) -> str:
-    original_prompt = prompt
-    prompt = _ensure_prompt_not_too_long(prompt, max_tokens)
-    messages = [
-        {
-            'role': 'system',
-            'content': (
-                'You always continue sentences provided '
-                'by the user and you never repeat what '
-                'the user has already said. All responses must end with a '
-                'period. Try not to use lists, but if you must, then '
-                'always delimit list items using either '
-                r"semicolons or single newline characters ('\n'), never "
-                r"delimit list items with double carriage returns ('\n\n')."
-            ),
-        },
-        {
-            'role': 'user',
-            'content': 'Question: Is Jake a turtle?\nAnswer: Jake is ',
-        },
-        {'role': 'assistant', 'content': 'not a turtle.'},
-        {
-            'role': 'user',
-            'content': (
-                'Question: What is Priya doing right now?\nAnswer: '
-                + 'Priya is currently '
-            ),
-        },
-        {'role': 'assistant', 'content': 'sleeping.'},
-        {'role': 'user', 'content': prompt},
-    ]
-
-    # gemma2 does not support `tokens` + `max_new_tokens` > 8193.
-    # gemma2 interprets our `max_tokens`` as their `max_new_tokens`.
-    max_tokens = min(max_tokens, _DEFAULT_NUM_RESPONSE_TOKENS)
-
-    result = ''
-    for attempts in range(_MAX_ATTEMPTS):
-      if attempts > 0:
-        seconds_to_sleep = (_SECONDS_TO_SLEEP_WHEN_RATE_LIMITED +
-                            random.uniform(-_JITTER_SECONDS, _JITTER_SECONDS))
-        if attempts >= _NUM_SILENT_ATTEMPTS:
-          print(
-              f'Sleeping for {seconds_to_sleep} seconds... '
-              + f'attempt: {attempts} / {_MAX_ATTEMPTS}'
+        Args:
+          model_name: The language model to use. For more details, see
+            https://api.together.xyz/models.
+          api_key: The API key to use when accessing the Together AI API. If None,
+            will use the TOGETHER_AI_API_KEY environment variable.
+          measurements: The measurements object to log usage statistics to.
+          channel: The channel to write the statistics to.
+        """
+        if api_key is None:
+            api_key = os.environ["TOGETHER_AI_API_KEY"]
+        self.base_url = os.environ.get("TOGETHER_AI_BASE_URL", None)
+        self._api_key = api_key
+        self._model_name = model_name
+        self._measurements = measurements
+        self._channel = channel
+        self.errors = []
+        if not self.base_url:
+          self._client = together.Together(
+              api_key=self._api_key,
+              base_url=self.base_url,
           )
-        time.sleep(seconds_to_sleep)
-      try:
-        response = self._client.chat.completions.create(
-            model=self._model_name,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            stop=terminators,
-            seed=seed,
-            stream=False,
-        )
-      except (together.error.RateLimitError,
+          self.errors = [
               together.error.APIError,
-              together.error.ServiceUnavailableError) as err:
-        if attempts >= _NUM_SILENT_ATTEMPTS:
-          print(f'  Exception: {err}')
-          print(f'  Text exception prompt: {prompt}')
-        if isinstance(err, together.error.APIError):
-          # If hit the error that arises from a prompt that is too long then
-          # re-run the trimming function with a more pessimistic guess of the
-          # the number of characters per token.
-          prompt = _ensure_prompt_not_too_long(original_prompt,
-                                               max_tokens,
-                                               guess_chars_per_token=1)
-        continue
-      else:
-        result = response.choices[0].message.content
-        break
-
-    if self._measurements is not None:
-      self._measurements.publish_datum(
-          self._channel,
-          {'raw_text_length': len(result)},
-      )
-
-    return result
-
-  @override
-  def sample_choice(
-      self,
-      prompt: str,
-      responses: Sequence[str],
-      *,
-      seed: int | None = None,
-  ) -> tuple[int, str, dict[str, float]]:
-
-    def _sample_choice(response: str) -> float:
-      augmented_prompt = prompt + response
-      original_augmented_prompt = augmented_prompt
-      augmented_prompt = _ensure_prompt_not_too_long(augmented_prompt, 1)
-      messages = [
-          {
-              'role': 'system',
-              'content': (
-                  'You always continue sentences provided '
-                  + 'by the user and you never repeat what '
-                  + 'the user already said.'
-              ),
-          },
-          {
-              'role': 'user',
-              'content': 'Question: Is Jake a turtle?\nAnswer: Jake is ',
-          },
-          {'role': 'assistant', 'content': 'not a turtle.'},
-          {
-              'role': 'user',
-              'content': (
-                  'Question: What is Priya doing right now?\nAnswer: '
-                  + 'Priya is currently '
-              ),
-          },
-          {'role': 'assistant', 'content': 'sleeping.'},
-          {'role': 'user', 'content': augmented_prompt},
-      ]
-
-      result = None
-      for attempts in range(_MAX_ATTEMPTS):
-        if attempts > 0:
-          seconds_to_sleep = (_SECONDS_TO_SLEEP_WHEN_RATE_LIMITED +
-                              random.uniform(-_JITTER_SECONDS, _JITTER_SECONDS))
-          if attempts >= _NUM_SILENT_ATTEMPTS:
-            print(
-                f'Sleeping for {seconds_to_sleep} seconds.. '
-                + f'attempt: {attempts} / {_MAX_ATTEMPTS}'
-            )
-          time.sleep(seconds_to_sleep)
-        try:
-          result = self._client.chat.completions.create(
-              model=self._model_name,
-              messages=messages,
-              max_tokens=1,
-              seed=seed,
-              logprobs=1,
-              stream=False,
-          )
-        except (together.error.RateLimitError,
-                together.error.APIError,
-                together.error.ServiceUnavailableError) as err:
-          if attempts >= _NUM_SILENT_ATTEMPTS:
-            print(f'  Exception: {err}')
-            print(f'  Choice exception prompt: {augmented_prompt}')
-          if isinstance(err, together.error.APIError):
-            # If hit the error that arises from a prompt that is too long then
-            # re-run the trimming function with a more pessimistic guess of the
-            # the number of characters per token.
-            augmented_prompt = _ensure_prompt_not_too_long(
-                original_augmented_prompt, 1, guess_chars_per_token=1)
-          continue
+              together.error.RateLimitError,
+              together.error.ServiceUnavailableError,
+          ]
         else:
-          break
+            import openai
+            self._client = openai.OpenAI(
+                api_key=self._api_key,
+                base_url=self.base_url,
+            )
+            self.errors = [
+                openai.APIError,
+                openai.RateLimitError,
+            ]
 
-      if result:
-        lp = sum(result.choices[0].logprobs.token_logprobs)
-      else:
-        raise ValueError(
-            f'Failed to get logprobs.\nException prompt: {augmented_prompt}')
+    @override
+    def sample_text(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = language_model.DEFAULT_MAX_TOKENS,
+        terminators: Collection[str] = language_model.DEFAULT_TERMINATORS,
+        temperature: float = language_model.DEFAULT_TEMPERATURE,
+        timeout: float = language_model.DEFAULT_TIMEOUT_SECONDS,
+        seed: int | None = None,
+    ) -> str:
+        original_prompt = prompt
+        prompt = _ensure_prompt_not_too_long(prompt, max_tokens)
+        messages = [
+            {
+                "role": "system" if not self.base_url else "user",
+                "content": (
+                    "You always continue sentences provided "
+                    "by the user and you never repeat what "
+                    "the user has already said. All responses must end with a "
+                    "period. Try not to use lists, but if you must, then "
+                    "always delimit list items using either "
+                    r"semicolons or single newline characters ('\n'), never "
+                    r"delimit list items with double carriage returns ('\n\n')."
+                    + "\n\nQuestion: Is Jake a turtle?\nAnswer: Jake is "
+                    if self.base_url
+                    else ""
+                    # "\n\nQuestion: Is Jake a turtle?\nAnswer: Jake is "
+                ),
+            },
+        ]
+        if not self.base_url:
+            messages.extend(
+                [
+                    {
+                        "role": "user",
+                        "content": "Question: Is Jake a turtle?\nAnswer: Jake is ",
+                    },
+                ]
+            )
 
-      return lp
+        messages.extend(
+            [
+                {"role": "assistant", "content": "not a turtle."},
+                {
+                    "role": "user",
+                    "content": (
+                        "Question: What is Priya doing right now?\nAnswer: "
+                        + "Priya is currently "
+                    ),
+                },
+                {"role": "assistant", "content": "sleeping."},
+                {"role": "user", "content": prompt},
+            ]
+        )
 
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-      logprobs_np = np.array(
-          list(executor.map(_sample_choice, responses))
-      ).reshape(-1)
+        # print(f"messages: {messages}")
 
-    idx = np.argmax(logprobs_np)
+        # gemma2 does not support `tokens` + `max_new_tokens` > 8193.
+        # gemma2 interprets our `max_tokens`` as their `max_new_tokens`.
+        max_tokens = min(max_tokens, _DEFAULT_NUM_RESPONSE_TOKENS)
 
-    # Get the corresponding response string
-    max_str = responses[idx]
+        result = ""
+        for attempts in range(_MAX_ATTEMPTS):
+            if attempts > 0:
+                seconds_to_sleep = _SECONDS_TO_SLEEP_WHEN_RATE_LIMITED + random.uniform(
+                    -_JITTER_SECONDS, _JITTER_SECONDS
+                )
+                if attempts >= _NUM_SILENT_ATTEMPTS:
+                    print(
+                        f"Sleeping for {seconds_to_sleep} seconds... "
+                        + f"attempt: {attempts} / {_MAX_ATTEMPTS}"
+                    )
+                time.sleep(seconds_to_sleep)
+            try:
+                response = self._client.chat.completions.create(
+                    model=self._model_name,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=timeout,
+                    stop=terminators,
+                    seed=seed,
+                    stream=False,
+                )
+            except tuple(self.errors) as err:
+                if attempts >= _NUM_SILENT_ATTEMPTS:
+                    print(f"  Exception: {err}")
+                    print(f"  Text exception prompt: {prompt}")
+                if isinstance(err, self.errors[0]):
+                    # If hit the error that arises from a prompt that is too long then
+                    # re-run the trimming function with a more pessimistic guess of the
+                    # the number of characters per token.
+                    prompt = _ensure_prompt_not_too_long(
+                        original_prompt, max_tokens, guess_chars_per_token=1
+                    )
+                continue
+            else:
+                result = response.choices[0].message.content
+                break
 
-    return idx, max_str, {r: logprobs_np[i] for i, r in enumerate(responses)}
+        if self._measurements is not None:
+            self._measurements.publish_datum(
+                self._channel,
+                {"raw_text_length": len(result)},
+            )
+
+        return result
+
+    @override
+    def sample_choice(
+        self,
+        prompt: str,
+        responses: Sequence[str],
+        *,
+        seed: int | None = None,
+    ) -> tuple[int, str, dict[str, float]]:
+        def _sample_choice(response: str) -> float:
+            augmented_prompt = prompt + response
+            original_augmented_prompt = augmented_prompt
+            augmented_prompt = _ensure_prompt_not_too_long(augmented_prompt, 1)
+            messages = [
+                {
+                    "role": "system" if not self.base_url else "user",
+                    "content": (
+                        "You always continue sentences provided "
+                        + "by the user and you never repeat what "
+                        + "the user already said."
+                        + "\n\nQuestion: Is Jake a turtle?\nAnswer: Jake is "
+                        if self.base_url
+                        else ""
+                    ),
+                }
+            ]
+            if not self.base_url:
+                messages.extend(
+                    [
+                        {
+                            "role": "user",
+                            "content": "Question: Is Jake a turtle?\nAnswer: Jake is ",
+                        },
+                    ]
+                )
+            messages.extend(
+                [
+                    {"role": "assistant", "content": "not a turtle."},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Question: What is Priya doing right now?\nAnswer: "
+                            + "Priya is currently "
+                        ),
+                    },
+                    {"role": "assistant", "content": "sleeping."},
+                    {"role": "user", "content": augmented_prompt},
+                ]
+            )
+
+            result = None
+            for attempts in range(_MAX_ATTEMPTS):
+                if attempts > 0:
+                    seconds_to_sleep = (
+                        _SECONDS_TO_SLEEP_WHEN_RATE_LIMITED
+                        + random.uniform(-_JITTER_SECONDS, _JITTER_SECONDS)
+                    )
+                    if attempts >= _NUM_SILENT_ATTEMPTS:
+                        print(
+                            f"Sleeping for {seconds_to_sleep} seconds.. "
+                            + f"attempt: {attempts} / {_MAX_ATTEMPTS}"
+                        )
+                    time.sleep(seconds_to_sleep)
+                try:
+                    result = self._client.chat.completions.create(
+                        model=self._model_name,
+                        messages=messages,
+                        max_tokens=1,
+                        seed=seed,
+                        logprobs=1,
+                        stream=False,
+                    )
+                except tuple(self.errors) as err:
+                    if attempts >= _NUM_SILENT_ATTEMPTS:
+                        print(f"  Exception: {err}")
+                        print(f"  Choice exception prompt: {augmented_prompt}")
+                    if isinstance(err, self.errors[0]):
+                        # If hit the error that arises from a prompt that is too long then
+                        # re-run the trimming function with a more pessimistic guess of the
+                        # the number of characters per token.
+                        augmented_prompt = _ensure_prompt_not_too_long(
+                            original_augmented_prompt, 1, guess_chars_per_token=1
+                        )
+                    continue
+                else:
+                    break
+
+            if result:
+                # print(result.choices[0].logprobs)
+                if not self.base_url:
+                    lp = sum(result.choices[0].logprobs.token_logprobs)
+                else:
+                    lp = sum(
+                        [
+                            token.dict()["logprob"]
+                            for token in result.choices[0].logprobs.content
+                        ]
+                    )
+            else:
+                raise ValueError(
+                    f"Failed to get logprobs.\nException prompt: {augmented_prompt}"
+                )
+
+            return lp
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            logprobs_np = np.array(
+                list(executor.map(_sample_choice, responses))
+            ).reshape(-1)
+
+        idx = np.argmax(logprobs_np)
+
+        # Get the corresponding response string
+        max_str = responses[idx]
+
+        return idx, max_str, {r: logprobs_np[i] for i, r in enumerate(responses)}
