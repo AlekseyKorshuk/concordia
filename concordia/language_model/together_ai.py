@@ -254,7 +254,7 @@ class Gemma2(language_model.LanguageModel):
         seed: int | None = None,
     ) -> tuple[int, str, dict[str, float]]:
         def _sample_choice(response: str) -> float:
-            augmented_prompt = prompt + response
+            augmented_prompt = prompt
             original_augmented_prompt = augmented_prompt
             augmented_prompt = _ensure_prompt_not_too_long(augmented_prompt, 1)
             messages = [
@@ -332,16 +332,26 @@ class Gemma2(language_model.LanguageModel):
                     break
 
             if result:
-                # print(result.choices[0].logprobs)
+                token_logprob_pairs = []
                 if not self.base_url:
-                    lp = sum(result.choices[0].logprobs.token_logprobs)
+                    # tokens=['('] token_logprobs=[-0.76171875] token_ids=[235278]
+                    token_logprob_pairs = [
+                        (token, logprob)
+                        for token, logprob in zip(result.choices[0].logprobs.tokens, result.choices[0].logprobs.token_logprobs)
+
+                    ]
                 else:
-                    lp = sum(
-                        [
-                            token.dict()["logprob"]
-                            for token in result.choices[0].logprobs.content
-                        ]
-                    )
+                    # ChoiceLogprobs(content=[ChatCompletionTokenLogprob(token='The', bytes=[84, 104, 101], logprob=-0.3335188031196594, top_logprobs=[])], refusal=None)
+                    token_logprob_pairs = [
+                        (token.dict()["token"], token.dict()["logprob"])
+                        for token in result.choices[0].logprobs.content
+                    ]
+                
+                response_logprob = [
+                    logprob for token, logprob in token_logprob_pairs if token.startswith(response)
+                ]
+                lp = response_logprob[0] if len(response_logprob) > 0 else float('-inf')
+                # print(f"\n\n\n###\n{messages[-1]}\n\n{prompt}\n->{response}\n->{result.choices[0].message.content}\n->{result.choices[0].logprobs}\n->{lp}")
             else:
                 raise ValueError(
                     f"Failed to get logprobs.\nException prompt: {augmented_prompt}"
@@ -360,3 +370,8 @@ class Gemma2(language_model.LanguageModel):
         max_str = responses[idx]
 
         return idx, max_str, {r: logprobs_np[i] for i, r in enumerate(responses)}
+
+
+
+
+
