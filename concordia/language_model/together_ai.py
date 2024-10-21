@@ -42,7 +42,8 @@ _GUESS_CHARS_PER_TOKEN = 4
 # Max tokens is really 8193, but we leave substantial margin since estimates
 # of the number of tokens are imprecise and also calculated before adding the
 # system messages.
-_MAX_ALLOWED_TOKENS = 7000
+# _MAX_ALLOWED_TOKENS = 7000
+_MAX_ALLOWED_TOKENS = 64000
 # Use `_NUM_INITIAL_TOKENS` from the start of the prompt if possible when
 # trimming to fit the whole sequence into `_MAX_ALLOWED_TOKENS`.
 _NUM_INITIAL_TOKENS = 500
@@ -253,123 +254,95 @@ class Gemma2(language_model.LanguageModel):
         *,
         seed: int | None = None,
     ) -> tuple[int, str, dict[str, float]]:
-        def _sample_choice(response: str) -> float:
-            augmented_prompt = prompt
-            original_augmented_prompt = augmented_prompt
-            augmented_prompt = _ensure_prompt_not_too_long(augmented_prompt, 1)
-            messages = [
-                {
-                    "role": "system" if not self.base_url else "user",
-                    "content": (
-                        "You always continue sentences provided "
-                        + "by the user and you never repeat what "
-                        + "the user already said."
-                        + "\n\nQuestion: Is Jake a turtle?\nAnswer: Jake is "
-                        if self.base_url
-                        else ""
-                    ),
-                }
-            ]
-            if not self.base_url:
-                messages.extend(
-                    [
-                        {
-                            "role": "user",
-                            "content": "Question: Is Jake a turtle?\nAnswer: Jake is ",
-                        },
-                    ]
-                )
-            messages.extend(
-                [
-                    {"role": "assistant", "content": "not a turtle."},
-                    {
-                        "role": "user",
-                        "content": (
-                            "Question: What is Priya doing right now?\nAnswer: "
-                            + "Priya is currently "
-                        ),
-                    },
-                    {"role": "assistant", "content": "sleeping."},
-                    {"role": "user", "content": augmented_prompt},
-                ]
-            )
+        augmented_prompt = _ensure_prompt_not_too_long(prompt, 1)
+        messages = [
+            {
+                "role": "system" if not self.base_url else "user",
+                "content": (
+                    "You always continue sentences provided "
+                    "by the user and you never repeat what "
+                    "the user already said."
+                    + "\n\nQuestion: Is Jake a turtle?\nAnswer: Jake is "
+                    if self.base_url
+                    else ""
+                ),
+            }
+        ]
+        if not self.base_url:
+            messages.append({
+                "role": "user",
+                "content": "Question: Is Jake a turtle?\nAnswer: Jake is ",
+            })
+        messages.extend([
+            {"role": "assistant", "content": "not a turtle."},
+            {
+                "role": "user",
+                "content": "Question: What is Priya doing right now?\nAnswer: Priya is currently ",
+            },
+            {"role": "assistant", "content": "sleeping."},
+            {"role": "user", "content": augmented_prompt},
+        ])
 
-            result = None
-            for attempts in range(_MAX_ATTEMPTS):
-                if attempts > 0:
-                    seconds_to_sleep = (
-                        _SECONDS_TO_SLEEP_WHEN_RATE_LIMITED
-                        + random.uniform(-_JITTER_SECONDS, _JITTER_SECONDS)
-                    )
-                    if attempts >= _NUM_SILENT_ATTEMPTS:
-                        print(
-                            f"Sleeping for {seconds_to_sleep} seconds.. "
-                            + f"attempt: {attempts} / {_MAX_ATTEMPTS}"
-                        )
-                    time.sleep(seconds_to_sleep)
-                try:
-                    result = self._client.chat.completions.create(
-                        model=self._model_name,
-                        messages=messages,
-                        max_tokens=1,
-                        seed=seed,
-                        logprobs=1,
-                        stream=False,
-                    )
-                except tuple(self.errors) as err:
-                    if attempts >= _NUM_SILENT_ATTEMPTS:
-                        print(f"  Exception: {err}")
-                        print(f"  Choice exception prompt: {augmented_prompt}")
-                    if isinstance(err, self.errors[0]):
-                        # If hit the error that arises from a prompt that is too long then
-                        # re-run the trimming function with a more pessimistic guess of the
-                        # the number of characters per token.
-                        augmented_prompt = _ensure_prompt_not_too_long(
-                            original_augmented_prompt, 1, guess_chars_per_token=1
-                        )
-                    continue
-                else:
+        result = None
+        for attempts in range(_MAX_ATTEMPTS):
+            if attempts > 0:
+                seconds_to_sleep = _SECONDS_TO_SLEEP_WHEN_RATE_LIMITED + random.uniform(-_JITTER_SECONDS, _JITTER_SECONDS)
+                if attempts >= _NUM_SILENT_ATTEMPTS:
+                    print(f"Sleeping for {seconds_to_sleep} seconds.. attempt: {attempts} / {_MAX_ATTEMPTS}")
+                time.sleep(seconds_to_sleep)
+            try:
+                lp_args = {
+                    "logprobs": True,
+                    "top_logprobs": 20,
+                } if self.base_url else {"logprobs": 1}
+                result = self._client.chat.completions.create(
+                    model=self._model_name,
+                    messages=messages,
+                    max_tokens=1,
+                    seed=seed,
+                    stream=False,
+                    **lp_args,
+                )
+                break
+            except tuple(self.errors) as err:
+                if attempts >= _NUM_SILENT_ATTEMPTS:
+                    print(f"  Exception: {err}")
+                    print(f"  Choice exception prompt: {augmented_prompt}")
+                continue
+
+        if not result:
+            raise ValueError(f"Failed to get logprobs.\nException prompt: {augmented_prompt}")
+
+        logprobs = {}
+        if self.base_url:
+            top_logprobs = {
+                token.token: token.logprob
+                for token in result.choices[0].logprobs.content
+            }
+        else:
+            top_logprobs = {
+                token: logprob
+                for token, logprob in zip(result.choices[0].logprobs.tokens, result.choices[0].logprobs.token_logprobs)
+            }
+
+        parsed_responses = []
+        for response in responses:
+            matching_logprob = None
+            # next((lp for token, lp in top_logprobs.items() if token.strip().lower() == response.strip().lower()), None)
+            for token, lp in top_logprobs.items():
+                if token.strip().lower() == response.strip().lower():
+                    matching_logprob = lp
+                    parsed_responses.append(token)
                     break
+            logprobs[response] = matching_logprob if matching_logprob is not None else float('-inf')
 
-            if result:
-                token_logprob_pairs = []
-                if not self.base_url:
-                    # tokens=['('] token_logprobs=[-0.76171875] token_ids=[235278]
-                    token_logprob_pairs = [
-                        (token, logprob)
-                        for token, logprob in zip(result.choices[0].logprobs.tokens, result.choices[0].logprobs.token_logprobs)
-
-                    ]
-                else:
-                    # ChoiceLogprobs(content=[ChatCompletionTokenLogprob(token='The', bytes=[84, 104, 101], logprob=-0.3335188031196594, top_logprobs=[])], refusal=None)
-                    token_logprob_pairs = [
-                        (token.dict()["token"], token.dict()["logprob"])
-                        for token in result.choices[0].logprobs.content
-                    ]
-                
-                response_logprob = [
-                    logprob for token, logprob in token_logprob_pairs if token.startswith(response)
-                ]
-                lp = response_logprob[0] if len(response_logprob) > 0 else float('-inf')
-                # print(f"\n\n\n###\n{messages[-1]}\n\n{prompt}\n->{response}\n->{result.choices[0].message.content}\n->{result.choices[0].logprobs}\n->{lp}")
-            else:
-                raise ValueError(
-                    f"Failed to get logprobs.\nException prompt: {augmented_prompt}"
-                )
-
-            return lp
-
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            logprobs_np = np.array(
-                list(executor.map(_sample_choice, responses))
-            ).reshape(-1)
-
-        idx = np.argmax(logprobs_np)
-
-        # Get the corresponding response string
+        idx = max(range(len(responses)), key=lambda i: logprobs[responses[i]])
         max_str = responses[idx]
 
-        return idx, max_str, {r: logprobs_np[i] for i, r in enumerate(responses)}
+        print(f"Validation: responses={responses}, logprobs={logprobs}, parsed_responses={parsed_responses}, selected_idx={idx}, selected_response={max_str}")
+
+        return idx, max_str, logprobs
+
 
 
 
