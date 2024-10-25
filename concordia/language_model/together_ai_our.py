@@ -42,8 +42,8 @@ _GUESS_CHARS_PER_TOKEN = 4
 # Max tokens is really 8193, but we leave substantial margin since estimates
 # of the number of tokens are imprecise and also calculated before adding the
 # system messages.
-# _MAX_ALLOWED_TOKENS = 7000
-_MAX_ALLOWED_TOKENS = 64000
+_MAX_ALLOWED_TOKENS = 7000
+# _MAX_ALLOWED_TOKENS = 64000
 # Use `_NUM_INITIAL_TOKENS` from the start of the prompt if possible when
 # trimming to fit the whole sequence into `_MAX_ALLOWED_TOKENS`.
 _NUM_INITIAL_TOKENS = 500
