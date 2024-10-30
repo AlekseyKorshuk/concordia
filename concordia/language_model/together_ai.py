@@ -21,6 +21,7 @@ Recommended model names are:
 
 from collections.abc import Collection, Sequence
 import concurrent.futures
+import json
 import os
 import random
 import time
@@ -31,6 +32,7 @@ from concordia.utils import measurements as measurements_lib
 import numpy as np
 import together
 from typing_extensions import override
+
 
 _MAX_ATTEMPTS = 20
 _NUM_SILENT_ATTEMPTS = 3
@@ -43,10 +45,31 @@ _GUESS_CHARS_PER_TOKEN = 4
 # of the number of tokens are imprecise and also calculated before adding the
 # system messages.
 _MAX_ALLOWED_TOKENS = 7000
-# _MAX_ALLOWED_TOKENS = 64000
 # Use `_NUM_INITIAL_TOKENS` from the start of the prompt if possible when
 # trimming to fit the whole sequence into `_MAX_ALLOWED_TOKENS`.
 _NUM_INITIAL_TOKENS = 500
+
+
+def _find_response_start_index(tokens, is_openai: bool = False):
+    r"""Finds the start of the response in the prompt.
+
+    Args:
+      tokens: A list of strings.
+
+    Returns:
+      The index of the last occurrence of '<start_of_turn>' followed by 'model'
+      and '\n', or 1 if the sequence is not found. This corresponds to the start
+      of the response.
+    """
+    assert len(tokens) >= 3, "Response doesn't match expectation."
+    for i in range(len(tokens) - 3, -1, -1):
+        if (
+            (tokens[i] == "<start_of_turn>" or is_openai)
+            and tokens[i + 1] == "model"
+            and tokens[i + 2] == "\n"
+        ):
+            return i + 3  # Return the index after the sequence
+    raise ValueError("Response doesn't match expectation.")
 
 
 def _ensure_prompt_not_too_long(
@@ -117,17 +140,18 @@ class Gemma2(language_model.LanguageModel):
         self._channel = channel
         self.errors = []
         if not self.base_url:
-          self._client = together.Together(
-              api_key=self._api_key,
-              base_url=self.base_url,
-          )
-          self.errors = [
-              together.error.APIError,
-              together.error.RateLimitError,
-              together.error.ServiceUnavailableError,
-          ]
+            self._client = together.Together(
+                api_key=self._api_key,
+                base_url=self.base_url,
+            )
+            self.errors = [
+                together.error.APIError,
+                together.error.RateLimitError,
+                together.error.ServiceUnavailableError,
+            ]
         else:
             import openai
+
             self._client = openai.OpenAI(
                 api_key=self._api_key,
                 base_url=self.base_url,
@@ -193,8 +217,6 @@ class Gemma2(language_model.LanguageModel):
             ]
         )
 
-        # print(f"messages: {messages}")
-
         # gemma2 does not support `tokens` + `max_new_tokens` > 8193.
         # gemma2 interprets our `max_tokens`` as their `max_new_tokens`.
         max_tokens = min(max_tokens, _DEFAULT_NUM_RESPONSE_TOKENS)
@@ -246,6 +268,106 @@ class Gemma2(language_model.LanguageModel):
 
         return result
 
+    def _sample_choice(self, prompt: str, response: str) -> float:
+        """Returns the log probability of the prompt and response."""
+        original_prompt = prompt
+        augmented_prompt = _ensure_prompt_not_too_long(prompt, len(response))
+        attempts = 0
+        for attempts in range(_MAX_ATTEMPTS):
+            if attempts > 0:
+                seconds_to_sleep = _SECONDS_TO_SLEEP_WHEN_RATE_LIMITED + random.uniform(
+                    -_JITTER_SECONDS, _JITTER_SECONDS
+                )
+                if attempts >= _NUM_SILENT_ATTEMPTS:
+                    print(
+                        f"Sleeping for {seconds_to_sleep} seconds.. "
+                        + f"attempt: {attempts} / {_MAX_ATTEMPTS}"
+                    )
+                time.sleep(seconds_to_sleep)
+            try:
+                messages = [
+                    {
+                        "role": "system" if not self.base_url else "user",
+                        "content": (
+                            "You always continue sentences provided "
+                            "by the user and you never repeat what "
+                            "the user already said."
+                            + "\n\nQuestion: Is Jake a turtle?\nAnswer: Jake is "
+                            if self.base_url
+                            else ""
+                        ),
+                    }
+                ]
+                if not self.base_url:
+                    messages.append({
+                        "role": "user",
+                        "content": "Question: Is Jake a turtle?\nAnswer: Jake is ",
+                    })
+                messages.extend([
+                    {"role": "assistant", "content": "not a turtle."},
+                    {
+                        "role": "user",
+                        "content": "Question: What is Priya doing right now?\nAnswer: Priya is currently ",
+                    },
+                    {"role": "assistant", "content": "sleeping."},
+                    {"role": "user", "content": augmented_prompt},
+                    {"role": "assistant", "content": response},
+                ])
+                additional_args = {
+                    "echo": True,
+                } if not self.base_url else {
+                    "extra_body": {
+                        "prompt_logprobs": True,
+                        "add_generation_prompt": False,
+                        "top_logprobs": 1,
+                        "skip_special_tokens": False,
+                        "continue_final_message": True,
+                    },
+                }
+
+                result = self._client.chat.completions.create(
+                    model=self._model_name,
+                    messages=messages,
+                    max_tokens=1,
+                    seed=None,
+                    logprobs=1,
+                    stream=False,
+                    **additional_args,
+                )
+            except tuple(self.errors) as err:
+                if attempts >= _NUM_SILENT_ATTEMPTS:
+                    print(f"  Exception: {err}")
+                    print(f"  Choice exception prompt: {augmented_prompt}")
+                if isinstance(err, self.errors[0]):
+                    # If hit the error that arises from a prompt that is too long then
+                    # re-run the trimming function with a more pessimistic guess of the
+                    # the number of characters per token.
+                    augmented_prompt = _ensure_prompt_not_too_long(
+                        original_prompt, 1, guess_chars_per_token=1
+                    )
+                continue
+            else:
+                logprobs = result.prompt[0].logprobs if not self.base_url else result.prompt_logprobs
+                if self.base_url:
+                    tokens = [
+                        token[next(iter(token.keys()))]["decoded_token"] for token in logprobs if token
+                    ]
+                    token_logprobs = [
+                        token[next(iter(token.keys()))]["logprob"] for token in logprobs if token
+                    ]
+                else:
+                    tokens = logprobs.tokens
+                    token_logprobs = logprobs.token_logprobs
+                response_idx = _find_response_start_index(tokens, is_openai=self.base_url is not None)
+                response_log_probs = token_logprobs[response_idx:]
+                score = sum(response_log_probs)
+                return score
+
+        raise language_model.InvalidResponseError(
+            f"Failed to get logprobs after {attempts+1} attempts.\n Exception"
+            f" prompt: {augmented_prompt}"
+        )
+
     @override
     def sample_choice(
         self,
@@ -254,97 +376,39 @@ class Gemma2(language_model.LanguageModel):
         *,
         seed: int | None = None,
     ) -> tuple[int, str, dict[str, float]]:
-        augmented_prompt = _ensure_prompt_not_too_long(prompt, 1)
-        messages = [
-            {
-                "role": "system" if not self.base_url else "user",
-                "content": (
-                    "You always continue sentences provided "
-                    "by the user and you never repeat what "
-                    "the user already said."
-                    + "\n\nQuestion: Is Jake a turtle?\nAnswer: Jake is "
-                    if self.base_url
-                    else ""
-                ),
-            }
-        ]
-        if not self.base_url:
-            messages.append({
-                "role": "user",
-                "content": "Question: Is Jake a turtle?\nAnswer: Jake is ",
-            })
-        messages.extend([
-            {"role": "assistant", "content": "not a turtle."},
-            {
-                "role": "user",
-                "content": "Question: What is Priya doing right now?\nAnswer: Priya is currently ",
-            },
-            {"role": "assistant", "content": "sleeping."},
-            {"role": "user", "content": augmented_prompt},
-        ])
+        sample_choice_for_prompt = lambda x: self._sample_choice(prompt, x)
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            logprobs_np = np.array(
+                list(executor.map(sample_choice_for_prompt, responses))
+            ).reshape(-1)
 
-        result = None
-        for attempts in range(_MAX_ATTEMPTS):
-            if attempts > 0:
-                seconds_to_sleep = _SECONDS_TO_SLEEP_WHEN_RATE_LIMITED + random.uniform(-_JITTER_SECONDS, _JITTER_SECONDS)
-                if attempts >= _NUM_SILENT_ATTEMPTS:
-                    print(f"Sleeping for {seconds_to_sleep} seconds.. attempt: {attempts} / {_MAX_ATTEMPTS}")
-                time.sleep(seconds_to_sleep)
-            try:
-                lp_args = {
-                    "logprobs": True,
-                    "top_logprobs": 20,
-                } if self.base_url else {"logprobs": 1}
-                result = self._client.chat.completions.create(
-                    model=self._model_name,
-                    messages=messages,
-                    max_tokens=1,
-                    seed=seed,
-                    stream=False,
-                    **lp_args,
-                )
-                break
-            except tuple(self.errors) as err:
-                if attempts >= _NUM_SILENT_ATTEMPTS:
-                    print(f"  Exception: {err}")
-                    print(f"  Choice exception prompt: {augmented_prompt}")
-                continue
+        idx = np.argmax(logprobs_np)
 
-        if not result:
-            raise ValueError(f"Failed to get logprobs.\nException prompt: {augmented_prompt}")
-
-        logprobs = {}
-        if self.base_url:
-            top_logprobs = {
-                token.token: token.logprob
-                for token in result.choices[0].logprobs.content
-            }
-        else:
-            top_logprobs = {
-                token: logprob
-                for token, logprob in zip(result.choices[0].logprobs.tokens, result.choices[0].logprobs.token_logprobs)
-            }
-
-        parsed_responses = []
-        for response in responses:
-            matching_logprob = None
-            # next((lp for token, lp in top_logprobs.items() if token.strip().lower() == response.strip().lower()), None)
-            for token, lp in top_logprobs.items():
-                if token.strip().lower() == response.strip().lower():
-                    matching_logprob = lp
-                    parsed_responses.append(token)
-                    break
-            logprobs[response] = matching_logprob if matching_logprob is not None else float('-inf')
-
-        idx = max(range(len(responses)), key=lambda i: logprobs[responses[i]])
+        # Get the corresponding response string
         max_str = responses[idx]
 
-        print(f"Validation: responses={responses}, logprobs={logprobs}, parsed_responses={parsed_responses}, selected_idx={idx}, selected_response={max_str}")
-
-        return idx, max_str, logprobs
+        return idx, max_str, {r: logprobs_np[i] for i, r in enumerate(responses)}
 
 
 
-
-
-
+if __name__ == "__main__":
+    model = Gemma2(model_name="google/gemma-2-9b-it")
+    
+    # Example prompt and possible responses
+    prompt = "The capital of France is"
+    responses = [
+        " Paris.",
+        " London.",
+        " Berlin.",
+        " Madrid."
+    ]
+    
+    # Get the most likely response
+    idx, best_response, logprobs = model.sample_choice(prompt, responses)
+    
+    print(f"Prompt: {prompt}")
+    print(f"Best response: {best_response}")
+    print(f"Index of best response: {idx}")
+    print("\nLog probabilities for all responses:")
+    for response, logprob in logprobs.items():
+        print(f"{response.strip()}: {logprob:.2f}")
