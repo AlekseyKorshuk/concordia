@@ -328,6 +328,7 @@ def _evaluate_all_repetitions_on_one_scenario(
   json_dict = json.loads(json_str_)
   for i, outcome in enumerate(json_dict['simulation_outcomes']):
     outcome['num_model_calls'] = num_model_calls[i]
+  json_dict["num_model_calls"] = num_model_calls
   json_dict["total_num_model_calls"] = sum(num_model_calls)
   json_str_ = json.dumps(json_dict, indent=2)
   with open(scenario_json_filename, 'a', encoding='utf-8') as f:
