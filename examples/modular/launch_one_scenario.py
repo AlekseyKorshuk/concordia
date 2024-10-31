@@ -192,19 +192,28 @@ simulation_outcomes = []
 focal_per_capita_scores_to_average = []
 background_per_capita_scores_to_average = []
 ungrouped_per_capita_scores_to_average = []
+num_model_calls = []
 for repetition_idx in range(args.num_repetitions_per_scenario):
   measurements = measurements_lib.Measurements()
+  wrapped_model = call_limit_wrapper.CallLimitLanguageModel(model)
   runnable_simulation = scenarios_lib.build_simulation(
       scenario_config=scenario_config,
       model=model,
       focal_agent_module=agent_module,
       embedder=embedder,
       measurements=measurements,
-      override_agent_model=call_limit_wrapper.CallLimitLanguageModel(model),
+      override_agent_model=wrapped_model,
       seed=args.seed + repetition_idx,
   )
   # Run the simulation
   outcome, text_results_log = runnable_simulation()
+  num_model_calls_ = None
+  for agent in runnable_simulation._all_players:
+    if str(agent._act_component).__contains__(agent_module.__name__):
+      num_model_calls_ = agent._act_component._model._calls
+      break
+  num_model_calls.append(num_model_calls_)
+  print(f"\nNumber of calls: {num_model_calls_}")
   simulation_outcomes.append(outcome)
   if scenario_config.focal_is_resident:
     focal_scores = list(outcome.resident_scores.values())
@@ -258,5 +267,11 @@ scenario_json_filename = (
     f'{args.embedder_name}__only_{args.scenario_name}.json'
 ).replace('/', '_')
 json_str_ = scenario_result.to_json()
+import json
+json_dict = json.loads(json_str_)
+for i, outcome in enumerate(json_dict['simulation_outcomes']):
+  outcome['num_model_calls'] = num_model_calls[i]
+json_dict["total_num_model_calls"] = sum(num_model_calls)
+json_str_ = json.dumps(json_dict, indent=2)
 with open(scenario_json_filename, 'a', encoding='utf-8') as f:
   f.write(json_str_)

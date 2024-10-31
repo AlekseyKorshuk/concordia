@@ -71,6 +71,7 @@ import datetime
 import functools
 import importlib
 import os
+from typing import Tuple
 
 from concordia.language_model import call_limit_wrapper
 from concordia.language_model import utils
@@ -193,7 +194,7 @@ def _evaluate_one_repetition(
     scenario_name: str,
     scenario_config: scenarios_lib.ScenarioConfig,
     repetition_idx: int,
-) -> logging_lib.SimulationOutcome:
+) -> Tuple[logging_lib.SimulationOutcome, int]:
   """Evaluates the agent on one scenario, one repetition.
 
   Args:
@@ -224,7 +225,12 @@ def _evaluate_one_repetition(
   )
   with open(html_filename, 'a', encoding='utf-8') as f:
     f.write(text_results_log)
-  return outcome
+  num_model_calls_ = None
+  for agent in runnable_simulation._all_players:
+    if str(agent._act_component).__contains__(agent_module.__name__):
+      num_model_calls_ = agent._act_component._model._calls
+      break
+  return outcome, num_model_calls_
 
 
 def _evaluate_all_repetitions_on_one_scenario(
@@ -267,7 +273,8 @@ def _evaluate_all_repetitions_on_one_scenario(
         'Raised errors', list(exceptions_per_repetition.values())
     )
 
-  for repetition_idx, outcome in outputs_per_repetition.items():
+  num_model_calls = []
+  for repetition_idx, (outcome, num_model_calls_) in outputs_per_repetition.items():
     if scenario_config.focal_is_resident:
       focal_scores = list(outcome.resident_scores.values())
       background_scores = list(outcome.visitor_scores.values())
@@ -276,6 +283,8 @@ def _evaluate_all_repetitions_on_one_scenario(
       background_scores = list(outcome.resident_scores.values())
     # Ungrouped scores do not differentiate between focal and background.
     ungrouped_scores = focal_scores + background_scores
+    print(f"\nNumber of calls: {num_model_calls_}")
+    num_model_calls.append(num_model_calls_)
     # Calculate per capita scores.
     print(f'\nScores for repetition {repetition_idx}:')
     focal_per_capita_score = np.mean(focal_scores)
@@ -315,6 +324,12 @@ def _evaluate_all_repetitions_on_one_scenario(
   ).replace('/', '_')
   scenario_json_filename = os.path.join(results_dir, scenario_json_filename)
   json_str_ = scenario_result_.to_json()
+  import json
+  json_dict = json.loads(json_str_)
+  for i, outcome in enumerate(json_dict['simulation_outcomes']):
+    outcome['num_model_calls'] = num_model_calls[i]
+  json_dict["total_num_model_calls"] = sum(num_model_calls)
+  json_str_ = json.dumps(json_dict, indent=2)
   with open(scenario_json_filename, 'a', encoding='utf-8') as f:
     f.write(json_str_)
   return scenario_result_

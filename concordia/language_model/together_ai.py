@@ -25,8 +25,11 @@ import json
 import os
 import random
 import time
+import token
+from urllib.parse import urlparse
 
 from absl import logging
+import requests
 from concordia.language_model import language_model
 from concordia.utils import measurements as measurements_lib
 import numpy as np
@@ -151,6 +154,8 @@ class Gemma2(language_model.LanguageModel):
             ]
         else:
             import openai
+            from transformers import AutoTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(self._model_name)
 
             self._client = openai.OpenAI(
                 api_key=self._api_key,
@@ -316,24 +321,47 @@ class Gemma2(language_model.LanguageModel):
                 additional_args = {
                     "echo": True,
                 } if not self.base_url else {
+                    "echo": True,
                     "extra_body": {
-                        "prompt_logprobs": True,
-                        "add_generation_prompt": False,
-                        "top_logprobs": 1,
-                        "skip_special_tokens": False,
-                        "continue_final_message": True,
+                        "logprob_start_len": 0,
+                        "return_logprob": True,
+                        # "prompt_logprobs": True,
+                        # "add_generation_prompt": False,
+                        # "top_logprobs": 1,
+                        # "skip_special_tokens": False,
+                        # "continue_final_message": True,
                     },
                 }
-
-                result = self._client.chat.completions.create(
-                    model=self._model_name,
-                    messages=messages,
-                    max_tokens=1,
-                    seed=None,
-                    logprobs=1,
-                    stream=False,
-                    **additional_args,
-                )
+                if not self.base_url:
+                    result = self._client.chat.completions.create(
+                        model=self._model_name,
+                        messages=messages,
+                        max_tokens=1,
+                        seed=None,
+                        logprobs=1,
+                        stream=False,
+                        **additional_args,
+                    )
+                else:
+                    prompt_str = self.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=False,
+                    )
+                    parsed_url = urlparse(self.base_url)
+                    result = requests.post(
+                        f"{parsed_url.scheme}://{parsed_url.netloc}/generate",
+                        json={
+                            "text": prompt_str,
+                            "logprob_start_len": 0,
+                            "return_logprob": True,
+                            "return_text_in_logprobs": True,
+                            "sampling_params": {
+                                "temperature": 0,
+                                "max_new_tokens": 1,
+                            },
+                        },
+                    ).json()
             except tuple(self.errors) as err:
                 if attempts >= _NUM_SILENT_ATTEMPTS:
                     print(f"  Exception: {err}")
@@ -347,19 +375,27 @@ class Gemma2(language_model.LanguageModel):
                     )
                 continue
             else:
-                logprobs = result.prompt[0].logprobs if not self.base_url else result.prompt_logprobs
+                
                 if self.base_url:
                     tokens = [
-                        token[next(iter(token.keys()))]["decoded_token"] for token in logprobs if token
-                    ]
+                        token[2]
+                        for token in result["meta_info"]["input_token_logprobs"]
+                        if token[0] is not None
+                    ][:-2]
                     token_logprobs = [
-                        token[next(iter(token.keys()))]["logprob"] for token in logprobs if token
-                    ]
+                        token[0]
+                        for token in result["meta_info"]["input_token_logprobs"]
+                        if token[0] is not None
+                    ][:-2]
                 else:
+                    logprobs = result.prompt[0].logprobs
                     tokens = logprobs.tokens
                     token_logprobs = logprobs.token_logprobs
+                # print("Prompt:", "".join(tokens))
                 response_idx = _find_response_start_index(tokens, is_openai=self.base_url is not None)
                 response_log_probs = token_logprobs[response_idx:]
+                # print(f"Response tokens: {tokens[response_idx:]}")
+                # print(f"Response log probs: {response_log_probs}")
                 score = sum(response_log_probs)
                 return score
 
