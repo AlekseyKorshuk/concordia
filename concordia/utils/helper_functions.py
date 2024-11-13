@@ -19,7 +19,7 @@ import datetime
 import functools
 import json
 
-from concordia.agents import entity_agent_with_logging
+# from concordia.agents import entity_agent_with_logging
 from concordia.document import interactive_document
 from concordia.language_model import language_model
 from concordia.typing import component
@@ -150,7 +150,8 @@ def apply_recursively(
 
 
 def save_to_json(
-    agent: entity_agent_with_logging.EntityAgentWithLogging,
+    # agent: entity_agent_with_logging.EntityAgentWithLogging,
+    agent,
 ) -> str:
   """Saves an agent to JSON data.
 
